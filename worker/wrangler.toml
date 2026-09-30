@@ -1,0 +1,22 @@
+name = "hourly-bell-push"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+account_id = "5521d2925cb83025201cc0ce77b54bc9"
+
+# Create with: npx wrangler kv namespace create SUBSCRIPTIONS
+# Then paste the id below and uncomment.
+[[kv_namespaces]]
+binding = "SUBSCRIPTIONS"
+id = "48bcd07c3b6f466990fe89e1dd0ec385"
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+ALLOWED_ORIGIN = "https://hourly-notification.vercel.app"
+VAPID_SUBJECT = "mailto:hourly-bell@hourly-notification.vercel.app"
+VAPID_PUBLIC_KEY = "BBtxTryYmzrUW6bIAQG8RGnHlcNCyZlqLgoKuJw8OpStmwGkkx5k1MuuO1S0CLA_3RVK5WyWIw2WCiy6cEykDjY"
+
+# Set privately (do not commit):
+#   npx wrangler secret put VAPID_PRIVATE_KEY
+# Local dev: copy worker/.dev.vars.example → worker/.dev.vars

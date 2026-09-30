@@ -1,12 +1,9 @@
 /* Hourly Bell — service worker.
- * Fires one notification every HOUR_MS. State lives in the Cache API so it
- * survives the browser stopping and restarting this worker. */
+ * Hourly chimes are delivered by Web Push from the Cloudflare Worker.
+ * Local Cache state only drives the on-screen countdown. */
 
-const HOUR_MS = 3600 * 1000;
 const STATE_URL = "/__hourly-state";
 const STATE_CACHE = "hourly-state-v1";
-
-let timer = null;
 
 async function readState() {
   const cache = await caches.open(STATE_CACHE);
@@ -25,10 +22,10 @@ function announce(nextDue) {
   });
 }
 
-async function notify() {
+async function notify(bodyText) {
   const time = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   await self.registration.showNotification("The Hour Has Struck", {
-    body: `It is now ${time}. Take a moment to look up from your work.`,
+    body: bodyText || `It is now ${time}. Take a moment to look up from your work.`,
     icon: "/icon-192.png",
     badge: "/icon-192.png",
     tag: "hourly-bell",
@@ -37,50 +34,41 @@ async function notify() {
   });
 }
 
-/* Fire if due, then arm the next timeout. Safe to call at any wake-up. */
-async function tick() {
-  clearTimeout(timer);
-  const state = await readState();
-  if (!state.enabled) return;
-
-  const now = Date.now();
-  if (now >= state.nextDue) {
-    await notify();
-    state.nextDue = now + HOUR_MS;
-    await writeState(state);
-  }
-  announce(state.nextDue);
-  timer = setTimeout(tick, Math.max(1000, state.nextDue - Date.now()));
-}
-
-async function start() {
-  const state = await readState();
-  if (!state.enabled) {
-    await writeState({ enabled: true, nextDue: Date.now() + HOUR_MS });
-  }
-  await tick();
-}
-
-async function stop() {
-  clearTimeout(timer);
-  await writeState({ enabled: false, nextDue: 0 });
-  announce(0);
-}
-
 self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim().then(tick)));
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+
+self.addEventListener("push", (event) => {
+  event.waitUntil(
+    (async () => {
+      let nextDue = Date.now() + 3600 * 1000;
+      try {
+        const data = event.data ? event.data.json() : {};
+        if (typeof data.nextDue === "number") nextDue = data.nextDue;
+      } catch {
+        /* empty or non-json payload */
+      }
+      await writeState({ enabled: true, nextDue });
+      await notify();
+      announce(nextDue);
+    })()
+  );
+});
 
 self.addEventListener("message", (event) => {
   const type = event.data && event.data.type;
-  if (type === "start") event.waitUntil(start());
-  else if (type === "stop") event.waitUntil(stop());
-  else if (type === "ping") event.waitUntil(tick()); // heartbeat from an open page
-  else if (type === "test") event.waitUntil(notify());
-});
-
-// Chrome on Android may wake the worker for installed PWAs.
-self.addEventListener("periodicsync", (event) => {
-  if (event.tag === "hourly-bell") event.waitUntil(tick());
+  if (type === "set-state") {
+    event.waitUntil(
+      writeState(event.data.state).then(() => announce(event.data.state.nextDue))
+    );
+  } else if (type === "stop") {
+    event.waitUntil(
+      writeState({ enabled: false, nextDue: 0 }).then(() => announce(0))
+    );
+  } else if (type === "get-state") {
+    event.waitUntil(readState().then((s) => announce(s.enabled ? s.nextDue : 0)));
+  } else if (type === "test") {
+    event.waitUntil(notify("A trial chime — the real bell still arrives hourly."));
+  }
 });
 
 self.addEventListener("notificationclick", (event) => {

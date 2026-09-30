@@ -15,8 +15,9 @@ export default function Home() {
         </p>
         <NotificationPanel />
         <footer className="colophon">
-          Notifications are delivered by a service worker in your own browser.
-          No account is kept; no record is made.
+          Hourly chimes are delivered by Web Push from a small Cloudflare
+          Worker. Only your browser&rsquo;s push subscription is stored — no
+          account, no personal profile.
         </footer>
       </article>
     </main>

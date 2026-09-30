@@ -2,27 +2,72 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type Status = "loading" | "unsupported" | "idle" | "denied" | "active";
+type Status = "loading" | "unsupported" | "idle" | "denied" | "active" | "error";
+
+const PUSH_API =
+  process.env.NEXT_PUBLIC_PUSH_API_URL?.replace(/\/$/, "") || "";
+
+function urlBase64ToUint8Array(base64String: string) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  if (!PUSH_API) throw new Error("Push API URL is not configured");
+  const res = await fetch(`${PUSH_API}${path}`, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+  });
+  if (!res.ok) throw new Error(`API ${path} failed (${res.status})`);
+  return res.json() as Promise<T>;
+}
 
 export default function NotificationPanel() {
   const [status, setStatus] = useState<Status>("loading");
   const [nextDue, setNextDue] = useState(0);
   const [now, setNow] = useState(() => Date.now());
+  const [error, setError] = useState("");
   const regRef = useRef<ServiceWorkerRegistration | null>(null);
+  const endpointRef = useRef<string | null>(null);
 
-  const post = useCallback(async (type: string) => {
+  const post = useCallback(async (type: string, extra?: Record<string, unknown>) => {
     const reg = regRef.current ?? (await navigator.serviceWorker.ready);
-    (reg.active ?? navigator.serviceWorker.controller)?.postMessage({ type });
+    (reg.active ?? navigator.serviceWorker.controller)?.postMessage({ type, ...extra });
   }, []);
 
-  // Register the worker and restore prior state.
+  const syncFromServer = useCallback(async (endpoint: string) => {
+    const data = await api<{ enabled: boolean; nextDue: number }>("/sync", {
+      method: "POST",
+      body: JSON.stringify({ endpoint }),
+    });
+    if (!data.enabled) {
+      setStatus("idle");
+      setNextDue(0);
+      await post("stop");
+      return false;
+    }
+    setNextDue(data.nextDue);
+    setStatus("active");
+    await post("set-state", { state: { enabled: true, nextDue: data.nextDue } });
+    return true;
+  }, [post]);
+
   useEffect(() => {
-    if (!("serviceWorker" in navigator) || !("Notification" in window)) {
+    if (!("serviceWorker" in navigator) || !("Notification" in window) || !("PushManager" in window)) {
       setStatus("unsupported");
       return;
     }
-    let cancelled = false;
+    if (!PUSH_API) {
+      setStatus("error");
+      setError("Push server is not configured yet (NEXT_PUBLIC_PUSH_API_URL).");
+      return;
+    }
 
+    let cancelled = false;
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type !== "state") return;
       setNextDue(e.data.nextDue);
@@ -37,16 +82,25 @@ export default function NotificationPanel() {
       regRef.current = reg;
 
       if (Notification.permission === "denied") return setStatus("denied");
-      if (Notification.permission === "granted") {
-        const cache = await caches.open("hourly-state-v1");
-        const res = await cache.match("/__hourly-state");
-        const state = res ? await res.json() : null;
-        if (state?.enabled) {
-          setNextDue(state.nextDue);
-          setStatus("active");
-          post("ping");
-          return;
+
+      const existing = await reg.pushManager.getSubscription();
+      if (Notification.permission === "granted" && existing) {
+        endpointRef.current = existing.endpoint;
+        try {
+          const ok = await syncFromServer(existing.endpoint);
+          if (!ok) setStatus("idle");
+        } catch {
+          const cache = await caches.open("hourly-state-v1");
+          const res = await cache.match("/__hourly-state");
+          const state = res ? await res.json() : null;
+          if (state?.enabled && state.nextDue) {
+            setNextDue(state.nextDue);
+            setStatus("active");
+          } else {
+            setStatus("idle");
+          }
         }
+        return;
       }
       setStatus("idle");
     })();
@@ -55,40 +109,74 @@ export default function NotificationPanel() {
       cancelled = true;
       navigator.serviceWorker.removeEventListener("message", onMessage);
     };
-  }, [post]);
+  }, [syncFromServer]);
 
-  // Heartbeat keeps the worker's timer honest while the page is open.
   useEffect(() => {
     if (status !== "active") return;
-    const heartbeat = setInterval(() => post("ping"), 15_000);
     const clock = setInterval(() => setNow(Date.now()), 1000);
-    return () => {
-      clearInterval(heartbeat);
-      clearInterval(clock);
-    };
-  }, [status, post]);
+    return () => clearInterval(clock);
+  }, [status]);
 
-  // Best-effort background wake-ups (installed Android PWA only).
-  const registerPeriodicSync = async () => {
+  // Re-sync schedule when returning to the app (survives SW death).
+  useEffect(() => {
+    if (status !== "active") return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && endpointRef.current) {
+        syncFromServer(endpointRef.current).catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [status, syncFromServer]);
+
+  const enable = async () => {
+    setError("");
     try {
-      const reg = regRef.current as unknown as {
-        periodicSync?: { register: (tag: string, opts: { minInterval: number }) => Promise<void> };
-      };
-      await reg?.periodicSync?.register("hourly-bell", { minInterval: 3600 * 1000 });
-    } catch {
-      /* unsupported or not permitted; the in-worker timer still runs */
+      const result = await Notification.requestPermission();
+      if (result !== "granted") return setStatus(result === "denied" ? "denied" : "idle");
+
+      const reg = regRef.current ?? (await navigator.serviceWorker.ready);
+      const { publicKey } = await api<{ publicKey: string }>("/vapid-public-key");
+
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        });
+      }
+
+      endpointRef.current = sub.endpoint;
+      const data = await api<{ ok: boolean; nextDue: number }>("/subscribe", {
+        method: "POST",
+        body: JSON.stringify({ subscription: sub.toJSON() }),
+      });
+
+      setNextDue(data.nextDue);
+      setStatus("active");
+      await post("set-state", { state: { enabled: true, nextDue: data.nextDue } });
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "Could not enable the bell.");
     }
   };
 
-  const enable = async () => {
-    const result = await Notification.requestPermission();
-    if (result !== "granted") return setStatus(result === "denied" ? "denied" : "idle");
-    await post("start");
-    await registerPeriodicSync();
-    setStatus("active");
-  };
-
   const disable = async () => {
+    setError("");
+    try {
+      const reg = regRef.current ?? (await navigator.serviceWorker.ready);
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        await api("/unsubscribe", {
+          method: "POST",
+          body: JSON.stringify({ endpoint: sub.endpoint }),
+        });
+        await sub.unsubscribe();
+      }
+    } catch {
+      /* still clear local state */
+    }
+    endpointRef.current = null;
     await post("stop");
     setStatus("idle");
     setNextDue(0);
@@ -105,7 +193,7 @@ export default function NotificationPanel() {
 
       {status === "unsupported" && (
         <p className="note">
-          This browser does not support notifications. Kindly try Chrome on
+          This browser does not support push notifications. Kindly try Chrome on
           Android, or install this page to your home screen.
         </p>
       )}
@@ -115,6 +203,15 @@ export default function NotificationPanel() {
           Notifications have been declined. To reverse this, open your
           browser&rsquo;s site settings and permit notifications for this page.
         </p>
+      )}
+
+      {status === "error" && (
+        <>
+          <p className="note">{error || "Something went amiss."}</p>
+          <button className="btn" onClick={enable}>
+            Try Again
+          </button>
+        </>
       )}
 
       {status === "idle" && (
@@ -140,8 +237,8 @@ export default function NotificationPanel() {
             </button>
           </div>
           <p className="note small">
-            For the most reliable delivery on Android, use &ldquo;Add to Home
-            screen&rdquo; and leave the page installed.
+            Chimes are sent by a small cloud bell even when this page is closed.
+            For best results on Android, use &ldquo;Add to Home screen.&rdquo;
           </p>
         </>
       )}
