@@ -10,7 +10,7 @@ binding = "SUBSCRIPTIONS"
 id = "48bcd07c3b6f466990fe89e1dd0ec385"
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/5 * * * *"]
 
 [vars]
 ALLOWED_ORIGIN = "https://hourly-notification.vercel.app"
